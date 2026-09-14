@@ -1,0 +1,481 @@
+################################################################################
+# SEMI-SYNTHETIC SIMULATION — TPM, P ∈ {500, 1000, 2000}, 4 BLOCKS, 1 CENTER (n=200)
+# Parameterized version: the full simulation + analysis pipeline is wrapped
+# in run_pipeline_for_P(), called once for each value in P_SEQ.
+################################################################################
+suppressPackageStartupMessages({
+  library(MASS); library(survival); library(glmnet)
+  library(caret); library(Hmisc); library(timeROC)
+  library(dplyr); library(ggplot2); library(survminer)
+  library(patchwork); library(parallel); library(expm)
+  library(tidyr); library(scales); library(pec)
+})
+set.seed(42)
+################################################################################
+### Source data (log2 TPM), computed ONCE 
+data_TPM_log_full <- matrix_Scandare %>%
+  mutate(across(where(is.numeric), ~ log2(.x + 1)))
+save(data_TPM_log_full, file = "data_TPM_log_full.RData")
+
+#### Parameters of simulation
+P_SEQ      <- c(500L, 1000L, 2000L)   # ← the variation parameter requested
+N_BLOCKS   <- 4L
+S_BLOCK    <- 1L
+N_DEV      <- 400L
+N_EXT      <- 200L
+ALPHA_SEQ  <- seq(0.0, 1, 0.1)
+N_REP      <- 100
+N_CORES    <- 3L
+T_MAX          <- 5
+T_AUC          <- 3
+LAMBDA_GLOBAL  <- 4
+WEIBULL_SHAPE  <- 0.8
+
+### data saving
+ROOT_SAVE_DIR <- file.path("results", format(Sys.time(), "%Y%m%d_%H%M%S"))
+dir.create(ROOT_SAVE_DIR, recursive = TRUE, showWarnings = FALSE)
+cat(sprintf("📁 Root directory: %s\n", ROOT_SAVE_DIR))
+
+################################################################################
+# FUNCTIONS
+################################################################################
+build_block_list <- function(p, n_blocks) {
+  base_size <- floor(p / n_blocks)
+  remainder <- p %% n_blocks
+  sizes     <- rep(base_size, n_blocks)
+  sizes[seq_len(remainder)] <- base_size + 1L
+  ends   <- cumsum(sizes)
+  starts <- c(1L, ends[-n_blocks] + 1L)
+  mapply(seq, starts, ends, SIMPLIFY = FALSE)
+}
+
+build_blocks_from_real <- function(X_log, block_list) {
+  mu_global  <- colMeans(X_log)
+  cov_blocks <- lapply(block_list, function(idx) {
+    cov(X_log[, idx, drop = FALSE]) + 1e-6 * diag(length(idx))
+  })
+  mu_blocks <- lapply(block_list, function(idx) mu_global[idx])
+  list(cov = cov_blocks, mu = mu_blocks, mu_global = mu_global)
+}
+
+### controlling the magnitude of mu_blocks (here no modification)
+inject_block_signal <- function(mu_blocks, active_blocks, strength = 1) {
+  mu_new <- mu_blocks
+  for (b in active_blocks) mu_new[[b]] <- mu_new[[b]] * strength
+  mu_new
+}
+
+simulate_from_blocks <- function(cov_blocks, mu_blocks, n,
+                                  alpha = 0.5, apply_rotation = TRUE) {
+  X_blocks <- lapply(seq_along(cov_blocks), function(b) {
+    Sigma <- cov_blocks[[b]]
+    mu    <- mu_blocks[[b]]
+    p_b   <- length(mu)
+    if (apply_rotation && alpha > 0) {
+      A     <- matrix(rnorm(p_b^2), p_b)
+      R     <- qr.Q(qr((1 - alpha) * diag(p_b) + alpha * qr.Q(qr(A))))
+      Sigma <- t(R) %*% Sigma %*% R
+    }
+    MASS::mvrnorm(n, mu, Sigma)
+  })
+  do.call(cbind, X_blocks)
+}
+
+make_beta <- function(s, p, active_idx, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  bmax <- log(1.3); bmin <- log(1.05)
+  rks  <- sample(seq_len(s))
+  mags <- bmax * (1 - (rks - 1) / s)^2 + bmin
+  sgns <- ifelse(runif(s) < 0.20, -1, 1)
+  b    <- rep(0, p); b[active_idx] <- sgns * mags; b
+}
+
+calibrate_beta <- function(beta, X) {
+  mu_pilot <- colMeans(X)
+  Xc       <- sweep(X, 2, mu_pilot, "-")
+  LP       <- as.numeric(Xc %*% beta)
+  beta_cal <- beta / sd(LP)
+  attr(beta_cal, "mu_pilot") <- mu_pilot
+  beta_cal
+}
+
+sim_surv <- function(X, beta_eff,
+                      LAMBDA_GLOBAL = 4, WEIBULL_SHAPE = 0.8, T_MAX = 5) {
+  mu_pilot <- attr(beta_eff, "mu_pilot")
+  if (is.null(mu_pilot)) mu_pilot <- colMeans(X)
+  Xc <- sweep(X, 2, mu_pilot, "-")
+  LP <- as.numeric(Xc %*% beta_eff)
+  U  <- runif(nrow(Xc))
+  Tt <- LAMBDA_GLOBAL * exp(-LP / WEIBULL_SHAPE) * (-log(U))^(1 / WEIBULL_SHAPE)
+  data.frame(time = pmin(Tt, T_MAX), event = as.integer(Tt <= T_MAX), lp = LP)
+}
+
+bures_wasserstein_dist <- function(S1, S2) {
+  p <- nrow(S1); eps <- 1e-8
+  S1r <- S1 + eps * diag(p)
+  S2r <- S2 + eps * diag(p)
+  tryCatch({
+    S1_sqrt <- expm::sqrtm(S1r)
+    M       <- S1_sqrt %*% S2r %*% S1_sqrt
+    bw2     <- max(0, Re(sum(diag(S1r))) + Re(sum(diag(S2r))) -
+                     2 * Re(sum(diag(expm::sqrtm(M)))))
+    sqrt(bw2)
+  }, error = function(e) NA_real_)
+}
+
+run_method1 <- function(X_dev, surv_dev, X_ext, surv_ext, T_AUC) {
+  cv     <- cv.glmnet(X_dev, Surv(surv_dev$time, surv_dev$event), family = "cox")
+  coef_v <- as.numeric(coef(cv, s = "lambda.min"))
+  sel    <- which(coef_v != 0)
+  if (length(sel) == 0)
+    return(c(auc_int = NA, auc_ext = NA, ibs_int = NA, ibs_ext = NA, cindex = NA))
+  df_train <- as.data.frame(X_dev[, sel, drop = FALSE])
+  colnames(df_train) <- paste0("V", sel)
+  df_train$time  <- surv_dev$time
+  df_train$event <- surv_dev$event
+  fit    <- coxph(Surv(time, event) ~ ., data = df_train, x = TRUE, y = TRUE)
+  lp_int <- predict(fit, newdata = df_train, type = "lp")
+  auc_int <- tryCatch(timeROC::timeROC(
+    T = surv_dev$time, delta = surv_dev$event,
+    marker = lp_int, cause = 1, times = T_AUC
+  )$AUC[2], error = function(e) NA)
+  df_test <- as.data.frame(X_ext[, sel, drop = FALSE])
+  colnames(df_test) <- paste0("V", sel)
+  lp_ext  <- predict(fit, newdata = df_test, type = "lp")
+  auc_ext <- tryCatch(timeROC::timeROC(
+    T = surv_ext$time, delta = surv_ext$event,
+    marker = lp_ext, cause = 1, times = T_AUC
+  )$AUC[2], error = function(e) NA)
+  ci_ext <- tryCatch(
+    Hmisc::rcorr.cens(-lp_ext, Surv(surv_ext$time, surv_ext$event))["C Index"],
+    error = function(e) NA
+  )
+  df_test$time  <- as.numeric(surv_ext$time)
+  df_test$event <- as.integer(surv_ext$event)
+  pec_fit_int <- pec(
+    object = list(Cox = fit), formula = Surv(time, event) ~ 1,
+    data = df_train, exact = FALSE, cens.model = "marginal", splitMethod = "none"
+  )
+  ibs_int <- as.numeric(crps(pec_fit_int, times = 3, start = 0)[1])
+  pec_fit_ext <- pec(
+    object = list(Cox = fit), formula = Surv(time, event) ~ 1,
+    data = df_test, exact = FALSE, cens.model = "marginal", splitMethod = "none"
+  )
+  ibs_ext <- as.numeric(crps(pec_fit_ext, times = 3, start = 0)[1])
+  c(auc_int = auc_int, auc_ext = auc_ext, ibs_int = ibs_int, ibs_ext = ibs_ext, cindex = ci_ext)
+}
+
+run_one_rep <- function(r, alpha_dev, blocks, block_list, P, S_BLOCK,
+                         N_DEV, N_EXT, T_MAX, T_AUC,
+                         LAMBDA_GLOBAL, WEIBULL_SHAPE) {
+  set.seed(r * 1000 + round(alpha_dev * 100))
+  active_blocks <- sample(seq_along(block_list), S_BLOCK)
+  active_genes  <- unlist(block_list[active_blocks])
+  mu_signal     <- inject_block_signal(blocks$mu, active_blocks, strength = 1)
+  X_dev <- simulate_from_blocks(blocks$cov, mu_signal, N_DEV, alpha = alpha_dev, apply_rotation = TRUE)
+  X_ext <- simulate_from_blocks(blocks$cov, mu_signal, N_EXT, alpha = 0,         apply_rotation = FALSE)
+  beta     <- calibrate_beta(make_beta(length(active_genes), P, active_genes), X_dev)
+  surv_dev <- sim_surv(X_dev, beta, LAMBDA_GLOBAL, WEIBULL_SHAPE, T_MAX)
+  surv_ext <- sim_surv(X_ext, beta, LAMBDA_GLOBAL, WEIBULL_SHAPE, T_MAX)
+  metrics <- run_method1(X_dev, surv_dev, X_ext, surv_ext, T_AUC)
+  Sigma_dev  <- cov(X_dev) + 1e-6 * diag(ncol(X_dev))
+  Sigma_ext  <- cov(X_ext) + 1e-6 * diag(ncol(X_ext))
+  bw_val     <- bures_wasserstein_dist(Sigma_dev, Sigma_ext)
+  bw_metrics <- c(bw_centre1 = bw_val, bw_mean = bw_val, bw_pool = bw_val)
+  surv_snapshot <- NULL
+  if (r == 1) {
+    surv_snapshot <- rbind(
+      data.frame(surv_dev, group = paste0("Dev (alpha=",      alpha_dev, ")")),
+      data.frame(surv_ext, group = paste0("External (alpha=", alpha_dev, ")"))
+    )
+  }
+  list(metrics = metrics, bw_metrics = bw_metrics, surv_snapshot = surv_snapshot)
+}
+
+#################################################################################
+# FULL PIPELINE FOR A GIVEN VALUE OF P
+#################################################################################
+
+run_pipeline_for_P <- function(P_TARGET, data_TPM_log_full, root_save_dir,
+                                N_BLOCKS, S_BLOCK, N_DEV, N_EXT,
+                                ALPHA_SEQ, N_REP, N_CORES,
+                                T_MAX, T_AUC, LAMBDA_GLOBAL, WEIBULL_SHAPE) {
+  cat(sprintf("\n══════════════════════════════════════════════\n"))
+  cat(sprintf("▶ Starting pipeline for P = %d\n", P_TARGET))
+  cat(sprintf("══════════════════════════════════════════════\n"))
+  SAVE_DIR <- file.path(root_save_dir, sprintf("P_%d", P_TARGET))
+  dir.create(SAVE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+  ### 0. Select the P_TARGET most variable genes (from the full dataset)
+  data_TPM_log <- data_TPM_log_full
+  if (ncol(data_TPM_log) > P_TARGET) {
+    gene_vars    <- apply(data_TPM_log, 2, var)
+    top_genes    <- order(gene_vars, decreasing = TRUE)[seq_len(P_TARGET)]
+    data_TPM_log <- data_TPM_log[, top_genes]
+    cat(sprintf(" Subset: %d most variable genes selected\n", P_TARGET))
+  } else if (ncol(data_TPM_log) < P_TARGET) {
+    warning(sprintf("data_TPM_log only has %d columns — P_TARGET reduced to %d",
+                     ncol(data_TPM_log), ncol(data_TPM_log)))
+    P_TARGET <- ncol(data_TPM_log)
+  }
+  P <- ncol(data_TPM_log)
+
+  BLOCK_SIZE <- P / N_BLOCKS
+  cat(sprintf(" Configuration: P=%d | %d blocks of ~%.0f features | S_BLOCK=%d\n",
+              P, N_BLOCKS, BLOCK_SIZE, S_BLOCK))
+
+  ### 1. Real blocks
+  block_list <- build_block_list(P, n_blocks = N_BLOCKS)
+  blocks     <- build_blocks_from_real(data_TPM_log, block_list)
+  stopifnot(length(unlist(block_list)) == P)
+  cat(sprintf("✓ Number of blocks   : %d\n", length(block_list)))
+  cat(sprintf("✓ Block sizes        : %d – %d features\n",
+              min(lengths(block_list)), max(lengths(block_list))))
+
+  ### 2. Parallelized simulation over ALPHA_SEQ
+  cl <- makeCluster(N_CORES, type = "PSOCK")
+  clusterExport(cl, varlist = c(
+    "inject_block_signal", "simulate_from_blocks", "make_beta",
+    "calibrate_beta", "sim_surv", "run_method1", "bures_wasserstein_dist",
+    "blocks", "block_list", "P", "S_BLOCK",
+    "N_DEV", "N_EXT", "T_MAX", "T_AUC",
+    "LAMBDA_GLOBAL", "WEIBULL_SHAPE"
+  ), envir = environment())
+  clusterEvalQ(cl, {
+    suppressPackageStartupMessages({
+      library(MASS); library(survival); library(glmnet)
+      library(Hmisc); library(timeROC); library(expm); library(pec)
+    })
+  })
+
+  results_all <- list()
+  surv_curves <- list()
+
+  for (alpha_dev in ALPHA_SEQ) {
+    cat(sprintf("\n=== P=%d | ALPHA DEV = %.1f ===\n", P, alpha_dev))
+
+    rep_list <- parLapply(
+      cl, seq_len(N_REP), run_one_rep,
+      alpha_dev = alpha_dev, blocks = blocks, block_list = block_list, P = P,
+      S_BLOCK = S_BLOCK, N_DEV = N_DEV, N_EXT = N_EXT, T_MAX = T_MAX, T_AUC = T_AUC,
+      LAMBDA_GLOBAL = LAMBDA_GLOBAL, WEIBULL_SHAPE = WEIBULL_SHAPE
+    )
+
+    metrics_mat <- do.call(rbind, lapply(rep_list, `[[`, "metrics"))
+    bw_mat      <- do.call(rbind, lapply(rep_list, `[[`, "bw_metrics"))
+    results_all[[as.character(alpha_dev)]] <- cbind(metrics_mat, bw_mat)
+    surv_curves[[as.character(alpha_dev)]] <- rep_list[[1]]$surv_snapshot
+
+    saveRDS(results_all[[as.character(alpha_dev)]],
+            file = file.path(SAVE_DIR, sprintf("results_alpha_%.2f.rds", alpha_dev)))
+    cat(sprintf("  ✓ Intermediate save: results_alpha_%.2f.rds\n", alpha_dev))
+  }
+
+  stopCluster(cl)
+  cat(sprintf("✓ Cluster stopped (P=%d).\n", P))
+
+  ### 3. Summary + AUC gap
+  summary_df <- do.call(rbind, lapply(names(results_all), function(a) {
+    df <- as.data.frame(results_all[[a]])
+    data.frame(
+      alpha        = as.numeric(a),
+      auc_int_mean = mean(df$auc_int, na.rm = TRUE), auc_int_sd = sd(df$auc_int, na.rm = TRUE),
+      auc_ext_mean = mean(df$auc_ext, na.rm = TRUE), auc_ext_sd = sd(df$auc_ext, na.rm = TRUE),
+      gap_mean     = mean(df$auc_int - df$auc_ext, na.rm = TRUE),
+      gap_sd       = sd(df$auc_int - df$auc_ext, na.rm = TRUE),
+      ibs_int_mean = mean(df$ibs_int, na.rm = TRUE), ibs_int_sd = sd(df$ibs_int, na.rm = TRUE),
+      ibs_ext_mean = mean(df$ibs_ext, na.rm = TRUE), ibs_ext_sd = sd(df$ibs_ext, na.rm = TRUE),
+      ibs_gap_mean = mean(df$ibs_ext - df$ibs_int, na.rm = TRUE),
+      ibs_gap_sd   = sd(df$ibs_ext - df$ibs_int, na.rm = TRUE),
+      ci_mean      = mean(df$cindex, na.rm = TRUE), ci_sd = sd(df$cindex, na.rm = TRUE),
+      bw_mean_mean = mean(df$bw_mean, na.rm = TRUE), bw_mean_sd = sd(df$bw_mean, na.rm = TRUE)
+    )
+  }))
+
+  gap_long <- do.call(rbind, lapply(names(results_all), function(a) {
+    df <- as.data.frame(results_all[[a]])
+    data.frame(
+      alpha = as.numeric(a), gap = df$auc_int - df$auc_ext,
+      auc_int = df$auc_int, auc_ext = df$auc_ext,
+      bw_mean = df$bw_mean, bw_pool = df$bw_pool
+    )
+  }))
+
+  lm_gap   <- lm(gap ~ alpha, data = gap_long)
+  cor_test <- cor.test(gap_long$alpha, gap_long$gap, method = "spearman")
+  cor_bw_gap      <- cor.test(gap_long$bw_mean, gap_long$gap, method = "spearman")
+
+  cat(sprintf("\n── P=%d: AUC gap ~ alpha regression ──\n", P)); print(summary(lm_gap))
+  cat(sprintf("── P=%d: Spearman alpha~gap ──\n", P));           print(cor_test)
+  cat(sprintf("── P=%d: Spearman BW~gap ──\n", P));               print(cor_bw_gap)
+
+  raw_long <- do.call(rbind, lapply(names(results_all), function(a) {
+    df       <- as.data.frame(results_all[[a]])
+    df$alpha <- as.numeric(a)
+    df$rep   <- seq_len(nrow(df))
+    df
+  }))
+
+  ### 4. Saving outputs
+  saveRDS(results_all, file = file.path(SAVE_DIR, "results_all.rds"))
+  saveRDS(summary_df,  file = file.path(SAVE_DIR, "summary_df.rds"))
+  saveRDS(gap_long,    file = file.path(SAVE_DIR, "gap_long.rds"))
+  saveRDS(surv_curves, file = file.path(SAVE_DIR, "surv_curves.rds"))
+  saveRDS(lm_gap,      file = file.path(SAVE_DIR, "lm_gap.rds"))
+  saveRDS(cor_test,    file = file.path(SAVE_DIR, "cor_test.rds"))
+  write.csv(summary_df, file = file.path(SAVE_DIR, "summary_df.csv"), row.names = FALSE)
+  write.csv(gap_long,   file = file.path(SAVE_DIR, "gap_long.csv"),   row.names = FALSE)
+  write.csv(raw_long,   file = file.path(SAVE_DIR, "raw_results.csv"), row.names = FALSE)
+
+  cat(sprintf("\n✓ Save for P=%d complete in: %s\n", P, SAVE_DIR))
+
+  ### 5. Figures specific to this P 
+  fig_dir <- file.path(SAVE_DIR, "figures")
+  dir.create(fig_dir, showWarnings = FALSE)
+
+  # 5a. Survival curves (Dev by alpha vs single external reference)
+  surv_dev_df <- do.call(rbind, lapply(names(surv_curves), function(a) {
+    df <- surv_curves[[a]]
+    if (is.null(df)) return(NULL)
+    df[grepl("Dev", df$group), ]
+  }))
+  surv_ext_df <- surv_curves[[1]]
+  surv_ext_df <- surv_ext_df[grepl("External", surv_ext_df$group), ]
+  surv_ext_df$group <- "External (reference)"
+
+  surv_plot_df       <- rbind(surv_dev_df, surv_ext_df)
+  surv_plot_df$group <- as.factor(surv_plot_df$group)
+
+  dev_levels <- levels(surv_plot_df$group)[grepl("Dev", levels(surv_plot_df$group))]
+  ext_level  <- "External (reference)"
+  n_dev_lvl  <- length(dev_levels)
+  palette_dev <- scales::hue_pal()(n_dev_lvl)
+  names(palette_dev) <- dev_levels
+  palette_all  <- c(palette_dev, setNames("#B71C1C", ext_level))
+  linetype_all <- c(rep("solid", n_dev_lvl), setNames("dashed", ext_level))
+
+  fit_all <- survfit(Surv(time, event) ~ group, data = surv_plot_df)
+  p_surv <- ggsurvplot(
+    fit_all, data = surv_plot_df,
+    palette = palette_all[levels(surv_plot_df$group)],
+    linetype = linetype_all[levels(surv_plot_df$group)],
+    xlab = "Time (years)", ylab = "Survival probability",
+    title = sprintf("Survival curves (P=%d) — Internal by alpha (solid) & External ref (dashed)", P),
+    legend.title = "Group", ggtheme = theme_minimal(base_size = 13), risk.table = FALSE
+  )
+  ggsave(file.path(fig_dir, "survival_curves.png"), plot = p_surv$plot, width = 12, height = 7, dpi = 150)
+
+  # 5b. Variance ~ mean scatter plot (block 1)
+  var_mean_df <- data.frame(mean_var = blocks$mu[[1]], sd_var = sqrt(diag(blocks$cov[[1]])))
+  p_scatter <- ggplot(var_mean_df, aes(x = mean_var, y = sd_var)) +
+    geom_point(alpha = 0.3, size = 0.8, color = "#2196F3") +
+    geom_smooth(method = "loess", color = "#E53935", se = TRUE, linewidth = 1) +
+    labs(x = "Mean log2(TPM+1)", y = "SD log2(TPM+1)",
+         title = sprintf("Variance ~ Mean per variable (block 1, %d features, P=%d)",
+                          length(block_list[[1]]), P)) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "scatter_var_mean.png"), plot = p_scatter, width = 8, height = 6, dpi = 150)
+
+  # 5c. Internal vs external AUC ~ alpha
+  auc_long <- tidyr::pivot_longer(summary_df, cols = c(auc_int_mean, auc_ext_mean),
+                                   names_to = "type", values_to = "auc") %>%
+    mutate(sd = ifelse(type == "auc_int_mean", auc_int_sd, auc_ext_sd),
+           type = ifelse(type == "auc_int_mean", "Internal", "External"))
+
+  p_auc <- ggplot(auc_long, aes(x = alpha, y = auc, color = type, group = type)) +
+    geom_line(linewidth = 1.2) + geom_point(size = 3) +
+    geom_ribbon(aes(ymin = auc - sd, ymax = auc + sd, fill = type), alpha = 0.15, color = NA) +
+    scale_color_manual(values = c(Internal = "#1565C0", External = "#B71C1C")) +
+    scale_fill_manual(values  = c(Internal = "#1565C0", External = "#B71C1C")) +
+    labs(x = "Alpha (matrix distortion)", y = paste0("AUC at T=", T_AUC, " years (mean ± SD)"),
+         title = sprintf("Internal vs External AUC — P=%d, %d blocks", P, N_BLOCKS),
+         color = NULL, fill = NULL) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "auc_internal_external.png"), plot = p_auc, width = 8, height = 6, dpi = 150)
+
+  # 5d. AUC gap ~ alpha
+  p_gap <- ggplot(gap_long, aes(x = alpha, y = gap)) +
+    geom_jitter(width = 0.02, alpha = 0.4, color = "#6A1B9A") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    labs(x = "Alpha", y = "ΔAUC (internal − external)", title = sprintf("Alpha ~ AUC gap (P=%d)", P)) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "gap_auc_alpha.png"), plot = p_gap, width = 8, height = 6, dpi = 150)
+
+  # 5e. BW distance ~ AUC gap
+  p_bw <- ggplot(gap_long, aes(x = bw_mean, y = gap)) +
+    geom_point(alpha = 0.35, color = "#00695C") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    labs(x = "Bures-Wasserstein distance", y = "gap AUC",
+         title = sprintf("Correlation between BW distance and ΔAUC (P=%d)", P),
+         subtitle = sprintf("Spearman ρ = %.3f, p %s", round(cor_bw_gap$estimate, 3),
+                             ifelse(cor_bw_gap$p.value < 0.001, "< 0.001",
+                                    sprintf("= %.3f", cor_bw_gap$p.value)))) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "bw_gap_auc.png"), plot = p_bw, width = 8, height = 6, dpi = 150)
+
+  cat(sprintf("✓ Figures for P=%d saved in: %s\n", P, fig_dir))
+
+  list(
+    P = P, SAVE_DIR = SAVE_DIR,
+    results_all = results_all, summary_df = summary_df, gap_long = gap_long,
+    raw_long = raw_long, surv_curves = surv_curves,
+    lm_gap = lm_gap, cor_test = cor_test,
+    cor_bw_gap = cor_bw_gap, cor_bw_pool_gap = cor_bw_pool_gap
+  )
+}
+
+##################################################################################
+# RUN ACROSS ALL VALUES OF P
+##################################################################################
+
+pipeline_results <- setNames(
+  lapply(P_SEQ, function(P_TARGET) {
+    run_pipeline_for_P(
+      P_TARGET = P_TARGET, data_TPM_log_full = data_TPM_log_full,
+      root_save_dir = ROOT_SAVE_DIR,
+      N_BLOCKS = N_BLOCKS, S_BLOCK = S_BLOCK, N_DEV = N_DEV, N_EXT = N_EXT,
+      ALPHA_SEQ = ALPHA_SEQ, N_REP = N_REP, N_CORES = N_CORES,
+      T_MAX = T_MAX, T_AUC = T_AUC, LAMBDA_GLOBAL = LAMBDA_GLOBAL, WEIBULL_SHAPE = WEIBULL_SHAPE
+    )
+  }),
+  as.character(P_SEQ)
+)
+
+saveRDS(pipeline_results, file = file.path(ROOT_SAVE_DIR, "pipeline_results_all_P.rds"))
+
+##################################################################################═
+# COMPARATIVE MOSAIC — AUC gap ~ alpha, one panel per P (shared scales)
+# Fixes the bug in the original script: gap_long_500/1000/2000 all pointed
+# to the same gap_long object. Here each P keeps its own distinct gap_long,
+# pulled directly from pipeline_results.
+##################################################################################
+
+all_gap <- bind_rows(lapply(P_SEQ, function(p) {
+  pipeline_results[[as.character(p)]]$gap_long %>% mutate(p = p)
+}))
+
+x_range <- range(all_gap$alpha, na.rm = TRUE)
+y_range <- range(all_gap$gap,   na.rm = TRUE)
+
+make_gap_plot <- function(df, title_label) {
+  ggplot(df, aes(x = alpha, y = gap)) +
+    geom_jitter(width = 0.02, alpha = 0.4, color = "#6A1B9A") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    scale_x_continuous(limits = x_range) +
+    scale_y_continuous(limits = y_range) +
+    labs(x = "Alpha", y = "ΔAUC (internal − external)", title = title_label) +
+    theme_minimal(base_size = 13)
+}
+
+gap_plots <- lapply(P_SEQ, function(p) {
+  make_gap_plot(pipeline_results[[as.character(p)]]$gap_long, sprintf("P = %d", p))
+})
+
+mosaic_gap <- Reduce(`+`, gap_plots) + plot_layout(nrow = 1)
+print(mosaic_gap)
+
+ggsave(
+  filename = file.path(ROOT_SAVE_DIR, "mosaic_gap_auc.png"),
+  plot = mosaic_gap, width = 5 * length(P_SEQ), height = 5, dpi = 600
+)
+
