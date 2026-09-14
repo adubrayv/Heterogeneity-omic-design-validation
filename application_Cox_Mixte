@@ -1,7 +1,6 @@
 ###############################################################
 ## 1) LIBRARIES / DATA IMPORT
 ###############################################################
-
 library(survival)
 library(glmnet)
 library(parallel)
@@ -9,7 +8,7 @@ library(expm)
 library(timeROC)
 library(Hmisc)
 library(pec)
-library(coxme)   ## <-- mixed-effects Cox model (Gaussian frailty)
+library(coxme) 
 
 
 ###############################################################
@@ -191,6 +190,54 @@ predict_mixed_lp <- function(fit, newdata_X, center_new) {
 }
 
 ###############################################################
+## predictSurvProb METHOD FOR coxme OBJECTS
+###############################################################
+##
+## pec() needs a predictSurvProb.<class> method to turn a fitted
+## model into predicted survival probabilities S(t | X). No such
+## method ships with the coxme/pec packages, so pec() silently
+## fails on coxme fits (caught by tryCatch -> Brier/IBS = NA).
+##
+## Here we reconstruct S(t | X) manually:
+##   1) Baseline hazard via Breslow's estimator: refit a coxph
+##      model on the SAME data used to fit `object`, using the
+##      full mixed-model linear predictor (fixed + random effect)
+##      as an offset. This recovers S0(t) consistent with the
+##      coxme linear predictor without re-estimating coefficients.
+##   2) S(t | X) = S0(t) ^ exp(lp(X)), where lp(X) reuses
+##      predict_mixed_lp() so the same fixed+random-effect logic
+##      is used at prediction time as during evaluation.
+##
+## NOTE: this is a standard Breslow/offset approximation. It does
+## not re-estimate the frailty variance from held-out data; the
+## random-effect distribution is taken as fixed from `object`.
+##
+## `newdata` must contain a "center" column identifying the group
+## for the random-effect lookup (added to df_test_pec below).
+
+predictSurvProb.coxme <- function(object, newdata, times, ...) {
+  
+  if (!("center" %in% colnames(newdata))) {
+    stop("predictSurvProb.coxme requires a 'center' column in newdata.")
+  }
+  
+  ## 1) Breslow baseline hazard from the model's own training data ---
+  lp_train <- object$linear.predictor
+  y_train  <- object$y
+  
+  bh_fit <- coxph(y_train ~ offset(lp_train))
+  bh     <- survfit(bh_fit)
+  
+  S0 <- summary(bh, times = times, extend = TRUE)$surv
+  
+  ## 2) Linear predictor (fixed + random) for the new data ---
+  lp_new <- predict_mixed_lp(object, newdata, newdata$center)
+  
+  ##  3) S(t | X) = S0(t) ^ exp(lp(X)) ---
+  outer(exp(lp_new), S0, function(eta, s0) s0 ^ eta)
+}
+
+###############################################################
 ## EVALUATION - MIXED MODEL
 ###############################################################
 
@@ -239,12 +286,14 @@ evaluate_mixed_model <- function(fit, consensus_vars, X_test, surv_test, clin_te
     error = function(e) NA_real_
   )
   
-  ## NOTE: pec does not natively provide a predictSurvProb method
-  ## for coxme objects -> Brier/IBS will return NA for the mixed
-  ## model unless a predictSurvProb.coxme method is implemented.
+  ## predictSurvProb.coxme (defined above) lets pec() handle coxme
+  ## objects like any other model. We add a "center" column to the
+  ## test data so predict_mixed_lp() can look up the correct random
+  ## effect for each row.
   df_test_pec <- df_test
-  df_test_pec$time <- surv_test$time
-  df_test_pec$event <- surv_test$event
+  df_test_pec$time   <- surv_test$time
+  df_test_pec$event  <- surv_test$event
+  df_test_pec$center <- factor(center_test)
   
   pec_fit <- tryCatch(
     pec(
@@ -259,12 +308,21 @@ evaluate_mixed_model <- function(fit, consensus_vars, X_test, surv_test, clin_te
   )
   
   if (!is.null(pec_fit)) {
-    crps_values <- tryCatch(
+    ## Pointwise Brier score at t = T_AUC (nearest available time on
+    ## the pec grid) -- distinct from the integrated Brier score below.
+    brier_t3 <- tryCatch({
+      time_idx <- which.min(abs(pec_fit$time - T_AUC))
+      as.numeric(pec_fit$AppErr$CoxMixte[time_idx])
+    }, error = function(e) NA_real_)
+    
+    ## Integrated Brier Score (IBS) from 0 to T_AUC.
+    ibs_t3 <- tryCatch(
       as.numeric(crps(pec_fit, times = T_AUC, start = 0)[2]),
       error = function(e) NA_real_
     )
   } else {
-    crps_values <- NA_real_
+    brier_t3 <- NA_real_
+    ibs_t3   <- NA_real_
   }
   
   bw_dist <- tryCatch(
@@ -285,8 +343,8 @@ evaluate_mixed_model <- function(fit, consensus_vars, X_test, surv_test, clin_te
   c(
     auc = auc_obj,
     cindex = cindex_val,
-    brier = crps_values,
-    ibs = crps_values,
+    brier = brier_t3,
+    ibs = ibs_t3,
     bw = bw_dist
   )
 }
@@ -1046,4 +1104,3 @@ hybrid_outer_results_mixed <- do.call(
 )
 
 print(hybrid_outer_results_mixed)
-
