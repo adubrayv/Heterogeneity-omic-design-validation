@@ -1,0 +1,149 @@
+ ### Figures 
+  fig_dir <- file.path(SAVE_DIR, "figures")
+  dir.create(fig_dir, showWarnings = FALSE)
+
+  # a. Survival curves (Dev by alpha vs single external reference)
+  surv_dev_df <- do.call(rbind, lapply(names(surv_curves), function(a) {
+    df <- surv_curves[[a]]
+    if (is.null(df)) return(NULL)
+    df[grepl("Dev", df$group), ]
+  }))
+  surv_ext_df <- surv_curves[[1]]
+  surv_ext_df <- surv_ext_df[grepl("External", surv_ext_df$group), ]
+  surv_ext_df$group <- "External (reference)"
+
+  surv_plot_df       <- rbind(surv_dev_df, surv_ext_df)
+  surv_plot_df$group <- as.factor(surv_plot_df$group)
+
+  dev_levels <- levels(surv_plot_df$group)[grepl("Dev", levels(surv_plot_df$group))]
+  ext_level  <- "External (reference)"
+  n_dev_lvl  <- length(dev_levels)
+  palette_dev <- scales::hue_pal()(n_dev_lvl)
+  names(palette_dev) <- dev_levels
+  palette_all  <- c(palette_dev, setNames("#B71C1C", ext_level))
+  linetype_all <- c(rep("solid", n_dev_lvl), setNames("dashed", ext_level))
+
+  fit_all <- survfit(Surv(time, event) ~ group, data = surv_plot_df)
+  p_surv <- ggsurvplot(
+    fit_all, data = surv_plot_df,
+    palette = palette_all[levels(surv_plot_df$group)],
+    linetype = linetype_all[levels(surv_plot_df$group)],
+    xlab = "Time (years)", ylab = "Survival probability",
+    title = sprintf("Survival curves (P=%d) — Internal by alpha (solid) & External ref (dashed)", P),
+    legend.title = "Group", ggtheme = theme_minimal(base_size = 13), risk.table = FALSE
+  )
+  ggsave(file.path(fig_dir, "survival_curves.png"), plot = p_surv$plot, width = 12, height = 7, dpi = 150)
+
+  # b. Variance ~ mean scatter plot (block 1)
+  var_mean_df <- data.frame(mean_var = blocks$mu[[1]], sd_var = sqrt(diag(blocks$cov[[1]])))
+  p_scatter <- ggplot(var_mean_df, aes(x = mean_var, y = sd_var)) +
+    geom_point(alpha = 0.3, size = 0.8, color = "#2196F3") +
+    geom_smooth(method = "loess", color = "#E53935", se = TRUE, linewidth = 1) +
+    labs(x = "Mean log2(TPM+1)", y = "SD log2(TPM+1)",
+         title = sprintf("Variance ~ Mean per variable (block 1, %d features, P=%d)",
+                          length(block_list[[1]]), P)) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "scatter_var_mean.png"), plot = p_scatter, width = 8, height = 6, dpi = 150)
+
+  # c. Internal vs external AUC ~ alpha
+  auc_long <- tidyr::pivot_longer(summary_df, cols = c(auc_int_mean, auc_ext_mean),
+                                   names_to = "type", values_to = "auc") %>%
+    mutate(sd = ifelse(type == "auc_int_mean", auc_int_sd, auc_ext_sd),
+           type = ifelse(type == "auc_int_mean", "Internal", "External"))
+
+  p_auc <- ggplot(auc_long, aes(x = alpha, y = auc, color = type, group = type)) +
+    geom_line(linewidth = 1.2) + geom_point(size = 3) +
+    geom_ribbon(aes(ymin = auc - sd, ymax = auc + sd, fill = type), alpha = 0.15, color = NA) +
+    scale_color_manual(values = c(Internal = "#1565C0", External = "#B71C1C")) +
+    scale_fill_manual(values  = c(Internal = "#1565C0", External = "#B71C1C")) +
+    labs(x = "Alpha (matrix distortion)", y = paste0("AUC at T=", T_AUC, " years (mean ± SD)"),
+         title = sprintf("Internal vs External AUC — P=%d, %d blocks", P, N_BLOCKS),
+         color = NULL, fill = NULL) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "auc_internal_external.png"), plot = p_auc, width = 8, height = 6, dpi = 150)
+
+  # d. AUC gap ~ alpha
+  p_gap <- ggplot(gap_long, aes(x = alpha, y = gap)) +
+    geom_jitter(width = 0.02, alpha = 0.4, color = "#6A1B9A") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    labs(x = "Alpha", y = "ΔAUC (internal − external)", title = sprintf("Alpha ~ AUC gap (P=%d)", P)) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "gap_auc_alpha.png"), plot = p_gap, width = 8, height = 6, dpi = 150)
+
+  # e. BW distance ~ AUC gap
+  p_bw <- ggplot(gap_long, aes(x = bw_mean, y = gap)) +
+    geom_point(alpha = 0.35, color = "#00695C") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    labs(x = "Bures-Wasserstein distance", y = "gap AUC",
+         title = sprintf("Correlation between BW distance and ΔAUC (P=%d)", P),
+         subtitle = sprintf("Spearman ρ = %.3f, p %s", round(cor_bw_gap$estimate, 3),
+                             ifelse(cor_bw_gap$p.value < 0.001, "< 0.001",
+                                    sprintf("= %.3f", cor_bw_gap$p.value)))) +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(fig_dir, "bw_gap_auc.png"), plot = p_bw, width = 8, height = 6, dpi = 150)
+
+  cat(sprintf("✓ Figures for P=%d saved in: %s\n", P, fig_dir))
+
+  list(
+    P = P, SAVE_DIR = SAVE_DIR,
+    results_all = results_all, summary_df = summary_df, gap_long = gap_long,
+    raw_long = raw_long, surv_curves = surv_curves,
+    lm_gap = lm_gap, cor_test = cor_test,
+    cor_bw_gap = cor_bw_gap, cor_bw_pool_gap = cor_bw_pool_gap
+  )
+}
+
+##################################################################################
+# RUN ACROSS ALL VALUES OF P
+##################################################################################
+
+pipeline_results <- setNames(
+  lapply(P_SEQ, function(P_TARGET) {
+    run_pipeline_for_P(
+      P_TARGET = P_TARGET, data_TPM_log_full = data_TPM_log_full,
+      root_save_dir = ROOT_SAVE_DIR,
+      N_BLOCKS = N_BLOCKS, S_BLOCK = S_BLOCK, N_DEV = N_DEV, N_EXT = N_EXT,
+      ALPHA_SEQ = ALPHA_SEQ, N_REP = N_REP, N_CORES = N_CORES,
+      T_MAX = T_MAX, T_AUC = T_AUC, LAMBDA_GLOBAL = LAMBDA_GLOBAL, WEIBULL_SHAPE = WEIBULL_SHAPE
+    )
+  }),
+  as.character(P_SEQ)
+)
+
+saveRDS(pipeline_results, file = file.path(ROOT_SAVE_DIR, "pipeline_results_all_P.rds"))
+
+##################################################################################═
+# COMPARATIVE MOSAIC — AUC gap ~ alpha, one panel per P (shared scales)
+# Fixes the bug in the original script: gap_long_500/1000/2000 all pointed
+# to the same gap_long object. Here each P keeps its own distinct gap_long,
+# pulled directly from pipeline_results.
+##################################################################################
+
+all_gap <- bind_rows(lapply(P_SEQ, function(p) {
+  pipeline_results[[as.character(p)]]$gap_long %>% mutate(p = p)
+}))
+
+x_range <- range(all_gap$alpha, na.rm = TRUE)
+y_range <- range(all_gap$gap,   na.rm = TRUE)
+
+make_gap_plot <- function(df, title_label) {
+  ggplot(df, aes(x = alpha, y = gap)) +
+    geom_jitter(width = 0.02, alpha = 0.4, color = "#6A1B9A") +
+    geom_smooth(method = "lm", color = "#E65100", se = TRUE, linewidth = 1.2) +
+    scale_x_continuous(limits = x_range) +
+    scale_y_continuous(limits = y_range) +
+    labs(x = "Alpha", y = "ΔAUC (internal − external)", title = title_label) +
+    theme_minimal(base_size = 13)
+}
+
+gap_plots <- lapply(P_SEQ, function(p) {
+  make_gap_plot(pipeline_results[[as.character(p)]]$gap_long, sprintf("P = %d", p))
+})
+
+mosaic_gap <- Reduce(`+`, gap_plots) + plot_layout(nrow = 1)
+print(mosaic_gap)
+
+ggsave(
+  filename = file.path(ROOT_SAVE_DIR, "mosaic_gap_auc.png"),
+  plot = mosaic_gap, width = 5 * length(P_SEQ), height = 5, dpi = 600
+)
