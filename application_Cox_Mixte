@@ -1,0 +1,1049 @@
+###############################################################
+## 1) LIBRARIES / DATA IMPORT
+###############################################################
+
+library(survival)
+library(glmnet)
+library(parallel)
+library(expm)
+library(timeROC)
+library(Hmisc)
+library(pec)
+library(coxme)   ## <-- mixed-effects Cox model (Gaussian frailty)
+
+
+###############################################################
+## LOADING YOUR DATA
+### Data are the same as application_cox ###
+###############################################################
+## 0) TEMPORARY DIRECTORY
+###############################################################
+
+new_tmp <- "C:/Rtmp"
+dir.create(new_tmp, showWarnings = FALSE)
+Sys.setenv(TMPDIR = new_tmp, TEMP = new_tmp, TMP = new_tmp)
+
+###############################################################
+## 1) DATA PREPARATION
+###############################################################
+
+expr <- df_match[, 5:50546]
+df_match1 <- cbind(df_match[,1:4], expr)
+df_match1$cluster = df_match$cluster
+centers <- split(df_match1, df_match1$cluster)
+names(centers) <- c("center1", "center2", "center3")
+
+omics_list <- lapply(centers, function(d) as.matrix(d[, 5:50546]))
+surv_list  <- lapply(centers, function(d) data.frame(time = d$Time, event = d$event))
+clinical_list <- lapply(centers, function(d) data.frame(AGE = d$AGE, TNM = d$TNM))
+
+###############################################################
+## PARAMETERS
+###############################################################
+
+K_inner <- 10
+K_outer <- 5
+tau_consensus <- 0.50
+T_AUC <- 3
+n_keep <- 2000
+n_cores <- max(1, detectCores() - 1)
+center_names <- names(omics_list)
+
+###############################################################
+## CLEANING
+###############################################################
+
+clean_center <- function(X, surv_df, clin_df) {
+  ok <- !is.na(surv_df$time) &
+    !is.na(surv_df$event) &
+    surv_df$time > 0 &
+    surv_df$event %in% c(0, 1) &
+    complete.cases(X) &
+    complete.cases(clin_df)
+  list(
+    X = X[ok, , drop = FALSE],
+    surv = surv_df[ok, , drop = FALSE],
+    clin = clin_df[ok, , drop = FALSE]
+  )
+}
+
+cleaned <- Map(clean_center, omics_list, surv_list, clinical_list)
+omics_list <- lapply(cleaned, `[[`, "X")
+surv_list <- lapply(cleaned, `[[`, "surv")
+clinical_list <- lapply(cleaned, `[[`, "clin")
+
+###############################################################
+## UNIVARIATE FILTERING
+###############################################################
+
+univariate_cox_pval_strata <- function(j, Xmat, time, event, center) {
+  x <- Xmat[, j]
+  fit <- tryCatch(
+    coxph(Surv(time, event) ~ x + strata(center)),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+  coef_table <- summary(fit)$coefficients
+  if (is.null(coef_table) || nrow(coef_table) == 0) return(NA_real_)
+  pval <- coef_table[1, "Pr(>|z|)"]
+  if (!is.finite(pval)) return(NA_real_)
+  pval
+}
+
+compute_pvals <- function(Xmat, time, event, center, n_cores) {
+  if (.Platform$OS.type == "windows") {
+    cl <- makeCluster(n_cores)
+    on.exit(stopCluster(cl), add = TRUE)
+    clusterExport(cl, "univariate_cox_pval_strata", envir = environment())
+    clusterEvalQ(cl, library(survival))
+    pv <- parSapply(
+      cl,
+      seq_len(ncol(Xmat)),
+      univariate_cox_pval_strata,
+      Xmat = Xmat,
+      time = time,
+      event = event,
+      center = center
+    )
+  } else {
+    pv <- unlist(mclapply(
+      seq_len(ncol(Xmat)),
+      univariate_cox_pval_strata,
+      Xmat = Xmat,
+      time = time,
+      event = event,
+      center = center,
+      mc.cores = n_cores
+    ))
+  }
+  names(pv) <- colnames(Xmat)
+  pv
+}
+
+select_top_variables <- function(pvals, n_keep) {
+  pvals <- pvals[is.finite(pvals)]
+  pvals <- sort(pvals)
+  if (length(pvals) == 0) return(character(0))
+  names(pvals)[seq_len(min(n_keep, length(pvals)))]
+}
+
+#################################################################
+## MIXED-EFFECTS COX REFIT: FIXED EFFECTS (OMICS + AGE + TNM)
+## + RANDOM EFFECT (RANDOM INTERCEPT PER CENTER)
+#################################################################
+##
+## Model: Surv(time, event) ~ omics_vars + AGE + TNM + (1 | center)
+## -> "omics_vars + AGE + TNM" = fixed effects 
+
+refit_mixed_cox_fixed_vars <- function(X, surv_df, clin_df, center, vars) {
+  if (length(vars) > 0) {
+    df <- as.data.frame(X[, vars, drop = FALSE])
+    colnames(df) <- make.names(vars)
+  } else {
+    df <- data.frame(row.names = seq_len(nrow(X)))
+  }
+  df$AGE <- clin_df$AGE
+  df$TNM <- clin_df$TNM
+  df$time <- surv_df$time
+  df$event <- surv_df$event
+  df$center <- factor(center)
+  
+  covariate_names <- setdiff(colnames(df), c("time", "event", "center"))
+  formula_str <- paste(
+    "Surv(time, event) ~",
+    paste(covariate_names, collapse = " + "),
+    "+ (1 | center)"
+  )
+  
+  coxme(
+    as.formula(formula_str),
+    data = df
+  )
+}
+
+###############################################################
+## LINEAR PREDICTOR FOR THE MIXED MODEL (coxme)
+###############################################################
+
+predict_mixed_lp <- function(fit, newdata_X, center_new) {
+  fe <- fixef(fit)
+  covs <- intersect(names(fe), colnames(newdata_X))
+  lp_fixed <- as.numeric(
+    as.matrix(newdata_X[, covs, drop = FALSE]) %*% fe[covs]
+  )
+  
+  re_list <- tryCatch(ranef(fit), error = function(e) NULL)
+  re_center <- if (!is.null(re_list)) {
+    if ("center" %in% names(re_list)) re_list$center else re_list[[1]]
+  } else {
+    NULL
+  }
+  
+  center_new <- as.character(center_new)
+  if (is.null(re_center)) {
+    re_vals <- rep(0, length(center_new))
+  } else {
+    re_vals <- re_center[center_new]
+    re_vals[is.na(re_vals)] <- 0
+  }
+  
+  lp_fixed + re_vals
+}
+
+###############################################################
+## EVALUATION - MIXED MODEL
+###############################################################
+
+evaluate_mixed_model <- function(fit, consensus_vars, X_test, surv_test, clin_test,
+                                 center_test, X_train_full, X_test_full, T_AUC = 3) {
+  if (length(consensus_vars) > 0) {
+    df_test <- as.data.frame(X_test[, consensus_vars, drop = FALSE])
+    colnames(df_test) <- make.names(consensus_vars)
+  } else {
+    df_test <- data.frame(row.names = seq_len(nrow(X_test)))
+  }
+  df_test$AGE <- clin_test$AGE
+  df_test$TNM <- clin_test$TNM
+  
+  lp_test <- tryCatch(
+    predict_mixed_lp(fit, df_test, center_test),
+    error = function(e) rep(NA_real_, nrow(df_test))
+  )
+  
+  valid <- is.finite(lp_test)
+  time_auc <- surv_test$time[valid]
+  event_auc <- surv_test$event[valid]
+  marker_auc <- lp_test[valid]
+  
+  auc_obj <- tryCatch(
+    timeROC(
+      T = time_auc,
+      delta = event_auc,
+      marker = marker_auc,
+      cause = 1,
+      times = T_AUC
+    )$AUC[2],
+    error = function(e) NA_real_
+  )
+  
+  cindex_val <- tryCatch(
+    as.numeric(
+      Hmisc::rcorr.cens(
+        -lp_test[valid],
+        Surv(
+          surv_test$time[valid],
+          surv_test$event[valid]
+        )
+      )["C Index"]
+    ),
+    error = function(e) NA_real_
+  )
+  
+  ## NOTE: pec does not natively provide a predictSurvProb method
+  ## for coxme objects -> Brier/IBS will return NA for the mixed
+  ## model unless a predictSurvProb.coxme method is implemented.
+  df_test_pec <- df_test
+  df_test_pec$time <- surv_test$time
+  df_test_pec$event <- surv_test$event
+  
+  pec_fit <- tryCatch(
+    pec(
+      object = list(CoxMixte = fit),
+      formula = Surv(time, event) ~ 1,
+      data = df_test_pec,
+      exact = FALSE,
+      cens.model = "marginal",
+      splitMethod = "none"
+    ),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(pec_fit)) {
+    crps_values <- tryCatch(
+      as.numeric(crps(pec_fit, times = T_AUC, start = 0)[2]),
+      error = function(e) NA_real_
+    )
+  } else {
+    crps_values <- NA_real_
+  }
+  
+  bw_dist <- tryCatch(
+    {
+      Sigma1 <- cov(X_train_full)
+      Sigma2 <- cov(X_test_full)
+      Sigma1 <- Sigma1 + diag(1e-8, ncol(Sigma1))
+      Sigma2 <- Sigma2 + diag(1e-8, ncol(Sigma2))
+      sqrt_S1 <- Re(expm::sqrtm(Sigma1))
+      M <- sqrt_S1 %*% Sigma2 %*% sqrt_S1
+      sqrt_M <- Re(expm::sqrtm(M))
+      val <- sum(diag(Sigma1)) + sum(diag(Sigma2)) - 2 * sum(diag(sqrt_M))
+      sqrt(max(val, 0))
+    },
+    error = function(e) NA_real_
+  )
+  
+  c(
+    auc = auc_obj,
+    cindex = cindex_val,
+    brier = crps_values,
+    ibs = crps_values,
+    bw = bw_dist
+  )
+}
+
+###############################################################
+## BURES-WASSERSTEIN ON THE PRE-FILTERING MATRICES
+###############################################################
+## (unchanged: independent of the model's fixed/mixed structure)
+
+compute_bw_prefilter <- function(X_train, X_val,
+                                 time_train, event_train,
+                                 center_train = NULL,
+                                 n_keep = 2000,
+                                 n_cores = 1) {
+  
+  if (is.null(center_train)) {
+    center_train <- factor(rep("all", nrow(X_train)))
+  }
+  
+  pvals <- tryCatch(
+    compute_pvals(
+      X_train,
+      time_train,
+      event_train,
+      center_train,
+      n_cores
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(pvals)) {
+    return(list(bw = NA_real_, n_vars = 0L, vars = character(0)))
+  }
+  
+  vars_prefilter <- select_top_variables(pvals, n_keep)
+  vars_prefilter <- intersect(vars_prefilter, colnames(X_val))
+  
+  if (length(vars_prefilter) < 2) {
+    return(list(bw = NA_real_, n_vars = length(vars_prefilter), vars = vars_prefilter))
+  }
+  
+  Xtr <- X_train[, vars_prefilter, drop = FALSE]
+  Xva <- X_val[,   vars_prefilter, drop = FALSE]
+  
+  bw <- tryCatch(
+    {
+      Sigma1 <- cov(Xtr)
+      Sigma2 <- cov(Xva)
+      Sigma1 <- Sigma1 + diag(1e-8, ncol(Sigma1))
+      Sigma2 <- Sigma2 + diag(1e-8, ncol(Sigma2))
+      sqrt_S1 <- Re(expm::sqrtm(Sigma1))
+      M       <- sqrt_S1 %*% Sigma2 %*% sqrt_S1
+      sqrt_M  <- Re(expm::sqrtm(M))
+      val <- sum(diag(Sigma1)) + sum(diag(Sigma2)) - 2 * sum(diag(sqrt_M))
+      sqrt(max(val, 0))
+    },
+    error = function(e) NA_real_
+  )
+  
+  list(bw = bw, n_vars = length(vars_prefilter), vars = vars_prefilter)
+}
+
+###############################################################
+## NESTED CV WITHIN AN OUTER TRAINING SET - MIXED MODEL
+###############################################################
+
+select_best_mixed_model_inner <- function(X_outer_train, surv_outer_train,
+                                          clin_outer_train, center_outer_train,
+                                          K_inner = 10, n_keep = 2000,
+                                          n_cores = 1, seed = 1) {
+  set.seed(seed)
+  n <- nrow(X_outer_train)
+  inner_folds <- sample(rep(1:K_inner, length.out = n))
+  models_inner <- list()
+  variables_inner <- list()
+  metrics_inner <- list()
+  for (j in seq_len(K_inner)) {
+    idx_train <- which(inner_folds != j)
+    idx_val <- which(inner_folds == j)
+    if (length(idx_train) < 10 || length(idx_val) < 5) next
+    X_tr <- X_outer_train[idx_train, , drop = FALSE]
+    X_val <- X_outer_train[idx_val, , drop = FALSE]
+    surv_tr <- surv_outer_train[idx_train, , drop = FALSE]
+    surv_val <- surv_outer_train[idx_val, , drop = FALSE]
+    clin_tr <- clin_outer_train[idx_train, , drop = FALSE]
+    clin_val <- clin_outer_train[idx_val, , drop = FALSE]
+    center_tr <- center_outer_train[idx_train]
+    center_val <- center_outer_train[idx_val]
+    
+    pvals <- tryCatch(
+      compute_pvals(
+        X_tr,
+        surv_tr$time,
+        surv_tr$event,
+        center_tr,
+        n_cores
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(pvals)) next
+    vars <- select_top_variables(pvals, n_keep)
+    if (length(vars) == 0) next
+    vars <- intersect(vars, colnames(X_tr))
+    if (length(vars) == 0) next
+    X_tr_filtered <- X_tr[, vars, drop = FALSE]
+    cvfit <- tryCatch(
+      cv.glmnet(
+        X_tr_filtered,
+        Surv(surv_tr$time, surv_tr$event),
+        family = "cox",
+        nfolds = min(10, nrow(X_tr_filtered))
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(cvfit)) next
+    coef_lasso <- tryCatch(
+      as.numeric(coef(cvfit, s = "lambda.min")),
+      error = function(e) NULL
+    )
+    if (is.null(coef_lasso)) next
+    if (length(coef_lasso) != length(vars)) next
+    selected <- vars[is.finite(coef_lasso) & coef_lasso != 0]
+    selected <- unique(selected)
+    if (length(selected) == 0) next
+    
+    fit <- tryCatch(
+      refit_mixed_cox_fixed_vars(
+        X_tr,
+        surv_tr,
+        clin_tr,
+        center_tr,
+        selected
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+    
+    metric <- tryCatch(
+      evaluate_mixed_model(
+        fit = fit,
+        consensus_vars = selected,
+        X_test = X_val,
+        surv_test = surv_val,
+        clin_test = clin_val,
+        center_test = center_val,
+        X_train_full = X_tr[, selected, drop = FALSE],
+        X_test_full = X_val[, selected, drop = FALSE],
+        T_AUC = T_AUC
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(metric)) next
+    cindex_value <- suppressWarnings(as.numeric(metric["cindex"]))
+    if (length(cindex_value) != 1 || !is.finite(cindex_value)) next
+    
+    models_inner[[length(models_inner) + 1L]] <- fit
+    variables_inner[[length(variables_inner) + 1L]] <- selected
+    metrics_inner[[length(metrics_inner) + 1L]] <- metric
+  }
+  if (length(metrics_inner) == 0) return(NULL)
+  cindices <- vapply(
+    metrics_inner,
+    function(x) {
+      val <- suppressWarnings(as.numeric(x["cindex"]))
+      if (length(val) != 1 || !is.finite(val)) return(NA_real_)
+      val
+    },
+    numeric(1)
+  )
+  valid <- which(is.finite(cindices))
+  if (length(valid) == 0) return(NULL)
+  best_idx <- valid[which.max(cindices[valid])]
+  list(
+    best_model = models_inner[[best_idx]],
+    best_variables = variables_inner[[best_idx]],
+    best_metrics = metrics_inner[[best_idx]],
+    all_models = models_inner,
+    all_variables = variables_inner,
+    all_metrics = metrics_inner
+  )
+}
+
+###############################################################
+## STRATEGY 1: EXTERNAL LOCO NESTED CV - MIXED MODEL
+###############################################################
+
+results_external_mixed <- list()
+mixed_models_external <- list()
+variables_external_mixed <- list()
+consensus_external_mixed <- list()
+
+for (test_center in center_names) {
+  cat("\n============================================================\n")
+  cat("EXTERNAL CENTER:", test_center, "\n")
+  cat("============================================================\n")
+  
+  train_centers <- setdiff(center_names, test_center)
+  
+  X_dev <- do.call(rbind, omics_list[train_centers])
+  surv_dev <- do.call(rbind, surv_list[train_centers])
+  clin_dev <- do.call(rbind, clinical_list[train_centers])
+  
+  center_dev <- factor(
+    rep(
+      train_centers,
+      sapply(omics_list[train_centers], nrow)
+    )
+  )
+  
+  X_external <- omics_list[[test_center]]
+  surv_external <- surv_list[[test_center]]
+  clin_external <- clinical_list[[test_center]]
+  ## external center: never seen during training -> random effect = 0
+  center_external <- factor(rep(test_center, nrow(X_external)))
+  
+  set.seed(1000 + which(center_names == test_center))
+  outer_folds <- sample(rep(1:K_outer, length.out = nrow(X_dev)))
+  
+  best_variables_outer <- list()
+  best_mixed_models_outer <- list()
+  best_metrics_outer_mixed <- list()
+  
+  for (o in seq_len(K_outer)) {
+    cat("\nOuter fold", o, "/", K_outer, "\n")
+    
+    idx_train <- which(outer_folds != o)
+    idx_val <- which(outer_folds == o)
+    
+    X_outer_train <- X_dev[idx_train, , drop = FALSE]
+    X_outer_val <- X_dev[idx_val, , drop = FALSE]
+    surv_outer_train <- surv_dev[idx_train, , drop = FALSE]
+    surv_outer_val <- surv_dev[idx_val, , drop = FALSE]
+    clin_outer_train <- clin_dev[idx_train, , drop = FALSE]
+    clin_outer_val <- clin_dev[idx_val, , drop = FALSE]
+    center_outer_train <- center_dev[idx_train]
+    center_outer_val <- center_dev[idx_val]
+    
+    bw_prefilter_outer <- compute_bw_prefilter(
+      X_train      = X_outer_train,
+      X_val        = X_outer_val,
+      time_train   = surv_outer_train$time,
+      event_train  = surv_outer_train$event,
+      center_train = center_outer_train,
+      n_keep       = n_keep,
+      n_cores      = n_cores
+    )
+    cat(
+      "BW pre-filtering (outer", o, "):",
+      round(bw_prefilter_outer$bw, 4),
+      "over", bw_prefilter_outer$n_vars, "variables\n"
+    )
+    
+    nested_result <- select_best_mixed_model_inner(
+      X_outer_train = X_outer_train,
+      surv_outer_train = surv_outer_train,
+      clin_outer_train = clin_outer_train,
+      center_outer_train = center_outer_train,
+      K_inner = K_inner,
+      n_keep = n_keep,
+      n_cores = n_cores,
+      seed = 10000 + o
+    )
+    
+    if (is.null(nested_result)) {
+      cat("No valid model.\n")
+      next
+    }
+    
+    best_model <- nested_result$best_model
+    best_variables <- nested_result$best_variables
+    
+    outer_metrics_mixed <- evaluate_mixed_model(
+      fit = best_model,
+      consensus_vars = best_variables,
+      X_test = X_outer_val,
+      surv_test = surv_outer_val,
+      clin_test = clin_outer_val,
+      center_test = center_outer_val,
+      X_train_full = X_outer_train[, best_variables, drop = FALSE],
+      X_test_full = X_outer_val[, best_variables, drop = FALSE],
+      T_AUC = T_AUC
+    )
+    
+    outer_metrics_mixed <- c(outer_metrics_mixed, bw_prefilter = bw_prefilter_outer$bw)
+    
+    best_mixed_models_outer[[paste0("outer", o)]] <- best_model
+    best_variables_outer[[paste0("outer", o)]] <- best_variables
+    best_metrics_outer_mixed[[paste0("outer", o)]] <- outer_metrics_mixed
+    
+    cat(
+      "Variables:", length(best_variables),
+      "| C-index:", round(outer_metrics_mixed["cindex"], 4), "\n"
+    )
+  }
+  
+  valid_outer <- which(sapply(best_variables_outer, function(x) !is.null(x)))
+  
+  if (length(valid_outer) == 0) {
+    warning("No valid model for center ", test_center)
+    next
+  }
+  
+  all_candidates <- unique(unlist(best_variables_outer[valid_outer]))
+  selection_matrix <- matrix(
+    0,
+    nrow = length(valid_outer),
+    ncol = length(all_candidates),
+    dimnames = list(names(best_variables_outer)[valid_outer], all_candidates)
+  )
+  for (i in seq_along(valid_outer)) {
+    vars_i <- best_variables_outer[[valid_outer[i]]]
+    selection_matrix[i, vars_i] <- 1
+  }
+  frequency_outer <- colMeans(selection_matrix)
+  consensus_vars_external <- names(frequency_outer[frequency_outer >= tau_consensus])
+  
+  cat(
+    "\nConsensus:", length(consensus_vars_external),
+    "variables | threshold >", tau_consensus * 100, "%\n"
+  )
+  
+  final_external_mixed_model <- refit_mixed_cox_fixed_vars(
+    X_dev,
+    surv_dev,
+    clin_dev,
+    center_dev,
+    consensus_vars_external
+  )
+  
+  metrics_external_mixed <- evaluate_mixed_model(
+    fit = final_external_mixed_model,
+    consensus_vars = consensus_vars_external,
+    X_test = X_external,
+    surv_test = surv_external,
+    clin_test = clin_external,
+    center_test = center_external,
+    X_train_full = X_dev[, consensus_vars_external, drop = FALSE],
+    X_test_full = X_external[, consensus_vars_external, drop = FALSE],
+    T_AUC = T_AUC
+  )
+  
+  bw_prefilter_external <- compute_bw_prefilter(
+    X_train      = X_dev,
+    X_val        = X_external,
+    time_train   = surv_dev$time,
+    event_train  = surv_dev$event,
+    center_train = center_dev,
+    n_keep       = n_keep,
+    n_cores      = n_cores
+  )
+  metrics_external_mixed <- c(metrics_external_mixed, bw_prefilter = bw_prefilter_external$bw)
+  
+  results_external_mixed[[test_center]] <- metrics_external_mixed
+  mixed_models_external[[test_center]] <- final_external_mixed_model
+  variables_external_mixed[[test_center]] <- consensus_vars_external
+  
+  consensus_external_mixed[[test_center]] <- list(
+    frequency = frequency_outer,
+    selection_matrix = selection_matrix,
+    best_variables = best_variables_outer,
+    best_mixed_models = best_mixed_models_outer
+  )
+  
+  cat(
+    "EXTERNAL TEST (MIXED) - AUC:",
+    round(metrics_external_mixed["auc"], 4),
+    "| C-index:",
+    round(metrics_external_mixed["cindex"], 4),
+    "| Brier:",
+    round(metrics_external_mixed["brier"], 4),
+    "| BW pre-filtering:",
+    round(metrics_external_mixed["bw_prefilter"], 4),
+    "\n"
+  )
+}
+
+results_external_mixed_df <- do.call(rbind, results_external_mixed)
+
+results_external_mixed_df <- data.frame(
+  center = rownames(results_external_mixed_df),
+  results_external_mixed_df,
+  row.names = NULL
+)
+
+print(results_external_mixed_df)
+
+###############################################################
+## STRATEGY 2: HYBRID - MIXED MODEL
+## FOLD 5 = FINAL EXTERNAL TEST SET / FOLDS 1-4 = DEVELOPMENT
+###############################################################
+
+set.seed(2024)
+
+center_folds <- lapply(
+  center_names,
+  function(cn) sample(rep(1:K_outer, length.out = nrow(omics_list[[cn]])))
+)
+names(center_folds) <- center_names
+dev_folds <- 1:4
+external_fold <- 5
+
+###############################################################
+## FOLD 5: EXTERNAL HOLD-OUT
+###############################################################
+
+X_reserve_final <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    omics_list[[cn]][center_folds[[cn]] == external_fold, , drop = FALSE]
+  })
+)
+
+surv_reserve_final <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    surv_list[[cn]][center_folds[[cn]] == external_fold, , drop = FALSE]
+  })
+)
+
+clin_reserve_final <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    clinical_list[[cn]][center_folds[[cn]] == external_fold, , drop = FALSE]
+  })
+)
+
+## center of each row in the hold-out set (fold 5) -> known to the
+## final model (every center appears in folds 1-4)
+center_reserve_final <- factor(
+  rep(
+    center_names,
+    sapply(center_names, function(cn) sum(center_folds[[cn]] == external_fold))
+  )
+)
+
+cat("\n============================================================\n")
+cat("EXTERNAL HOLD-OUT: FOLD 5\n")
+cat("N =", nrow(X_reserve_final), "\n")
+cat("============================================================\n")
+
+###############################################################
+## OUTER FOLDS 1-4 - MIXED MODEL
+###############################################################
+
+best_mixed_models_hybrid <- list()
+best_variables_hybrid_mixed <- list()
+best_metrics_hybrid_mixed <- list()
+
+for (k in dev_folds) {
+  cat("\n============================================================\n")
+  cat("HYBRID (MIXED) - OUTER FOLD", k, "\n")
+  cat("============================================================\n")
+  
+  train_ids <- setdiff(dev_folds, k)
+  
+  X_outer_train <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      omics_list[[cn]][center_folds[[cn]] %in% train_ids, , drop = FALSE]
+    })
+  )
+  
+  surv_outer_train <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      surv_list[[cn]][center_folds[[cn]] %in% train_ids, , drop = FALSE]
+    })
+  )
+  
+  clin_outer_train <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      clinical_list[[cn]][center_folds[[cn]] %in% train_ids, , drop = FALSE]
+    })
+  )
+  
+  center_outer_train <- factor(
+    rep(
+      center_names,
+      sapply(center_names, function(cn) sum(center_folds[[cn]] %in% train_ids))
+    )
+  )
+  
+  X_outer_val <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      omics_list[[cn]][center_folds[[cn]] == k, , drop = FALSE]
+    })
+  )
+  
+  surv_outer_val <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      surv_list[[cn]][center_folds[[cn]] == k, , drop = FALSE]
+    })
+  )
+  
+  clin_outer_val <- do.call(
+    rbind,
+    lapply(center_names, function(cn) {
+      clinical_list[[cn]][center_folds[[cn]] == k, , drop = FALSE]
+    })
+  )
+  
+  center_outer_val <- factor(
+    rep(
+      center_names,
+      sapply(center_names, function(cn) sum(center_folds[[cn]] == k))
+    )
+  )
+  
+  bw_prefilter_hybrid_outer <- compute_bw_prefilter(
+    X_train      = X_outer_train,
+    X_val        = X_outer_val,
+    time_train   = surv_outer_train$time,
+    event_train  = surv_outer_train$event,
+    center_train = center_outer_train,
+    n_keep       = n_keep,
+    n_cores      = n_cores
+  )
+  cat(
+    "BW pre-filtering (outer", k, "):",
+    round(bw_prefilter_hybrid_outer$bw, 4),
+    "over", bw_prefilter_hybrid_outer$n_vars, "variables\n"
+  )
+  
+  nested_result <- select_best_mixed_model_inner(
+    X_outer_train = X_outer_train,
+    surv_outer_train = surv_outer_train,
+    clin_outer_train = clin_outer_train,
+    center_outer_train = center_outer_train,
+    K_inner = K_inner,
+    n_keep = n_keep,
+    n_cores = n_cores,
+    seed = 20000 + k
+  )
+  
+  if (is.null(nested_result)) {
+    warning("No best model for outer fold ", k)
+    next
+  }
+  
+  best_model <- nested_result$best_model
+  best_variables <- nested_result$best_variables
+  
+  best_metrics_mixed <- evaluate_mixed_model(
+    fit = best_model,
+    consensus_vars = best_variables,
+    X_test = X_outer_val,
+    surv_test = surv_outer_val,
+    clin_test = clin_outer_val,
+    center_test = center_outer_val,
+    X_train_full = X_outer_train[, best_variables, drop = FALSE],
+    X_test_full = X_outer_val[, best_variables, drop = FALSE],
+    T_AUC = T_AUC
+  )
+  
+  best_metrics_mixed <- c(best_metrics_mixed, bw_prefilter = bw_prefilter_hybrid_outer$bw)
+  
+  best_mixed_models_hybrid[[paste0("outer", k)]] <- best_model
+  best_variables_hybrid_mixed[[paste0("outer", k)]] <- best_variables
+  best_metrics_hybrid_mixed[[paste0("outer", k)]] <- best_metrics_mixed
+  
+  cat(
+    "Variables:", length(best_variables),
+    "| C-index:", round(best_metrics_mixed["cindex"], 4), "\n"
+  )
+}
+
+###############################################################
+## CONSENSUS ACROSS THE 4 BEST MODELS (MIXED)
+###############################################################
+
+valid_best <- which(sapply(best_variables_hybrid_mixed, function(x) !is.null(x)))
+
+if (length(valid_best) == 0) {
+  stop("No valid mixed BEST MODEL in the hybrid strategy.")
+}
+
+all_best_variables <- unique(unlist(best_variables_hybrid_mixed[valid_best]))
+
+selection_matrix_hybrid_mixed <- matrix(
+  0,
+  nrow = length(valid_best),
+  ncol = length(all_best_variables),
+  dimnames = list(names(best_variables_hybrid_mixed)[valid_best], all_best_variables)
+)
+
+for (i in seq_along(valid_best)) {
+  vars_i <- best_variables_hybrid_mixed[[valid_best[i]]]
+  selection_matrix_hybrid_mixed[i, vars_i] <- 1
+}
+
+frequency_best_mixed_models <- colMeans(selection_matrix_hybrid_mixed)
+
+consensus_vars_hybrid_mixed <- names(
+  frequency_best_mixed_models[frequency_best_mixed_models >= tau_consensus]
+)
+
+cat("\n============================================================\n")
+cat("HYBRID CONSENSUS (MIXED MODEL)\n")
+cat("Number of BEST MODELS:", length(valid_best), "\n")
+cat("Consensus variables:", length(consensus_vars_hybrid_mixed), "\n")
+cat("Threshold: >", tau_consensus * 100, "%\n")
+cat("Fixed effects: omics variables + AGE + TNM\n")
+cat("Random effect: intercept per center (1 | center)\n")
+cat("============================================================\n")
+
+consensus_frequency_table_mixed <- data.frame(
+  variable = names(frequency_best_mixed_models),
+  frequency = as.numeric(frequency_best_mixed_models),
+  selected = names(frequency_best_mixed_models) %in% consensus_vars_hybrid_mixed,
+  row.names = NULL
+)
+
+consensus_frequency_table_mixed <- consensus_frequency_table_mixed[
+  order(-consensus_frequency_table_mixed$frequency), , drop = FALSE
+]
+
+print(consensus_frequency_table_mixed)
+
+###############################################################
+## FINAL REFIT ON ALL FOLDS 1-4 - MIXED MODEL
+###############################################################
+
+X_dev_full <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    omics_list[[cn]][center_folds[[cn]] %in% dev_folds, , drop = FALSE]
+  })
+)
+
+surv_dev_full <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    surv_list[[cn]][center_folds[[cn]] %in% dev_folds, , drop = FALSE]
+  })
+)
+
+clin_dev_full <- do.call(
+  rbind,
+  lapply(center_names, function(cn) {
+    clinical_list[[cn]][center_folds[[cn]] %in% dev_folds, , drop = FALSE]
+  })
+)
+
+center_dev_full <- factor(
+  rep(
+    center_names,
+    sapply(center_names, function(cn) sum(center_folds[[cn]] %in% dev_folds))
+  )
+)
+
+cat("\nFinal development N:", nrow(X_dev_full), "\n")
+
+final_hybrid_mixed_model <- refit_mixed_cox_fixed_vars(
+  X = X_dev_full,
+  surv_df = surv_dev_full,
+  clin_df = clin_dev_full,
+  center = center_dev_full,
+  vars = consensus_vars_hybrid_mixed
+)
+
+###############################################################
+## FINAL TEST ON FOLD 5 - MIXED MODEL
+###############################################################
+
+metrics_reserve_mixed <- evaluate_mixed_model(
+  fit = final_hybrid_mixed_model,
+  consensus_vars = consensus_vars_hybrid_mixed,
+  X_test = X_reserve_final,
+  surv_test = surv_reserve_final,
+  clin_test = clin_reserve_final,
+  center_test = center_reserve_final,
+  X_train_full = X_dev_full[, consensus_vars_hybrid_mixed, drop = FALSE],
+  X_test_full = X_reserve_final[, consensus_vars_hybrid_mixed, drop = FALSE],
+  T_AUC = T_AUC
+)
+
+bw_prefilter_reserve <- compute_bw_prefilter(
+  X_train      = X_dev_full,
+  X_val        = X_reserve_final,
+  time_train   = surv_dev_full$time,
+  event_train  = surv_dev_full$event,
+  center_train = center_dev_full,
+  n_keep       = n_keep,
+  n_cores      = n_cores
+)
+metrics_reserve_mixed <- c(metrics_reserve_mixed, bw_prefilter = bw_prefilter_reserve$bw)
+
+cat("\n============================================================\n")
+cat("FINAL PERFORMANCE - HYBRID STRATEGY (MIXED MODEL)\n")
+cat("============================================================\n")
+cat("N development:", nrow(X_dev_full), "\n")
+cat("N external:", nrow(X_reserve_final), "\n")
+cat("Omics variables (fixed effects):", length(consensus_vars_hybrid_mixed), "\n")
+cat("Clinical variables (fixed effects): AGE + TNM\n")
+cat("Random effect: intercept per center\n")
+cat("AUC:", round(metrics_reserve_mixed["auc"], 4), "\n")
+cat("C-index:", round(metrics_reserve_mixed["cindex"], 4), "\n")
+cat("Brier:", round(metrics_reserve_mixed["brier"], 4), "\n")
+cat("IBS:", round(metrics_reserve_mixed["ibs"], 4), "\n")
+cat("Bures-Wasserstein (pre-filtering, n =", bw_prefilter_reserve$n_vars, "var.):",
+    round(metrics_reserve_mixed["bw_prefilter"], 4), "\n")
+
+###############################################################
+## RANDOM COMPONENT (BETWEEN-CENTER VARIANCE)
+###############################################################
+
+variance_centre_mixed <- tryCatch(VarCorr(final_hybrid_mixed_model), error = function(e) NULL)
+cat("\nVariance of the random effect (center):\n")
+print(variance_centre_mixed)
+
+###############################################################
+## FIXED-EFFECT COEFFICIENTS OF THE FINAL MIXED MODEL
+###############################################################
+
+fe_final <- fixef(final_hybrid_mixed_model)
+vc_final <- vcov(final_hybrid_mixed_model)
+se_final <- sqrt(diag(vc_final))
+z_final <- fe_final / se_final
+p_final <- 2 * pnorm(-abs(z_final))
+
+coef_final_hybrid_mixed <- data.frame(
+  variable = names(fe_final),
+  coefficient = as.numeric(fe_final),
+  HR = exp(as.numeric(fe_final)),
+  SE = as.numeric(se_final),
+  z = as.numeric(z_final),
+  p_value = as.numeric(p_final),
+  CI95_lower = exp(as.numeric(fe_final) - 1.96 * as.numeric(se_final)),
+  CI95_upper = exp(as.numeric(fe_final) + 1.96 * as.numeric(se_final)),
+  row.names = NULL
+)
+
+print(coef_final_hybrid_mixed)
+
+###############################################################
+## HYBRID OUTER RESULTS (MIXED)
+###############################################################
+
+hybrid_outer_results_mixed <- do.call(
+  rbind,
+  lapply(names(best_metrics_hybrid_mixed), function(nm) {
+    x <- best_metrics_hybrid_mixed[[nm]]
+    data.frame(
+      outer_fold = nm,
+      n_variables = length(best_variables_hybrid_mixed[[nm]]),
+      auc = as.numeric(x["auc"]),
+      cindex = as.numeric(x["cindex"]),
+      brier = as.numeric(x["brier"]),
+      ibs = as.numeric(x["ibs"]),
+      bw = as.numeric(x["bw"]),
+      bw_prefilter = as.numeric(x["bw_prefilter"]),
+      row.names = NULL
+    )
+  })
+)
+
+print(hybrid_outer_results_mixed)
+
